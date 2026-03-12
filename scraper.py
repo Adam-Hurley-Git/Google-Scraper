@@ -321,21 +321,49 @@ def scrape_business_card(page, element) -> dict:
 
     # Reviews count fallback
     if not info["reviews_count"]:
-        m = re.search(r'\((\d[\d,]*)\)', full_text)
+        # Try formats: (1,300), (1.3k), (1.3K), (523)
+        m = re.search(r'\(([\d,.]+[kKmM]?)\)', full_text)
         if m:
-            info["reviews_count"] = m.group(1).replace(",", "")
+            raw = m.group(1).replace(",", "")
+            # Convert shorthand like 1.3k -> 1300
+            km = re.match(r'^([\d.]+)([kKmM])$', raw)
+            if km:
+                num = float(km.group(1))
+                suffix = km.group(2).lower()
+                if suffix == 'k':
+                    info["reviews_count"] = str(int(num * 1000))
+                elif suffix == 'm':
+                    info["reviews_count"] = str(int(num * 1000000))
+            else:
+                info["reviews_count"] = raw
 
-    # Category: short line after name that isn't address/phone
+    # Category: short line after name that isn't address/phone/rating
     if not info["category"] and info["name"] and len(lines) > 1:
         name_idx = None
         for i, line in enumerate(lines):
             if line == info["name"]:
                 name_idx = i
                 break
-        if name_idx is not None and name_idx + 1 < len(lines):
-            candidate = lines[name_idx + 1]
-            if len(candidate) < 40 and not extract_phone(candidate) and not re.search(r'\d+\s+\w+\s+(St|Ave|Rd)', candidate, re.I):
-                info["category"] = candidate
+        if name_idx is not None:
+            # Check the next few lines after the name for a category
+            for offset in range(1, min(4, len(lines) - name_idx)):
+                candidate = lines[name_idx + offset]
+                # Skip if it looks like a rating (e.g. "4.6", "4.6(1.3k)")
+                if re.match(r'^\d\.\d', candidate):
+                    continue
+                # Skip if it looks like an address
+                if re.search(r'\d+\s+\w+\s+(St|Ave|Rd|Blvd|Street|Road|Neath|High)', candidate, re.I):
+                    continue
+                # Skip phone numbers
+                if extract_phone(candidate):
+                    continue
+                # Skip if it contains pricing symbols only
+                if re.match(r'^[$£€·\s]+$', candidate):
+                    continue
+                # Good category candidate: short, text-like
+                if len(candidate) < 40 and re.search(r'[a-zA-Z]', candidate):
+                    info["category"] = candidate
+                    break
 
     # Phone
     if not info["phone"]:
@@ -355,11 +383,13 @@ def scrape_business_card(page, element) -> dict:
                 info["address"] = line
                 break
 
-    # Hours
+    # Hours (match "Open", "Opens", "Closed", "Closes", time patterns)
     for line in lines:
-        if re.search(r'(Open|Closed|Hours|am|pm|AM|PM)', line):
-            info["hours"] = line
-            break
+        if re.search(r'(Opens?\b|Closes?\b|Hours|Hrs|\d{1,2}:\d{2}\s*(am|pm|AM|PM)|\d{1,2}\s*(am|pm|AM|PM))', line):
+            # Skip lines that are clearly not hours (e.g. addresses, names)
+            if not re.search(r'\d+\s+\w+\s+(St|Ave|Rd|Street|Road)', line, re.I):
+                info["hours"] = line
+                break
 
     # Price range
     m = re.search(r'([$£€]{1,4})\s*[-–]\s*([$£€]{1,4})', full_text)
@@ -388,6 +418,9 @@ def scrape_detail_panel(page, card, debug: bool = False, timeout: int = 8000) ->
         "website": None,
         "phone": None,
         "address": None,
+        "hours": None,
+        "reviews_count": None,
+        "google_maps_url": None,
         "socials": [],
     }
 
@@ -494,7 +527,64 @@ def scrape_detail_panel(page, card, debug: bool = False, timeout: int = 8000) ->
             except Exception:
                 pass
 
-        # 6. Extract social links
+        # 6. Extract hours from detail panel
+        for sel in [
+            "[data-attrid*='hours'] span",
+            "[data-attrid*='hours']",
+            "span:has-text('Opens')",
+            "span:has-text('Closes')",
+            "span:has-text('Open')",
+            "span:has-text('Closed')",
+        ]:
+            try:
+                hours_el = page.query_selector(sel)
+                if hours_el:
+                    txt = hours_el.inner_text().strip()
+                    if txt and re.search(r'(Opens?\b|Closes?\b|hours|:\d{2}|am|pm|AM|PM)', txt, re.I):
+                        extra["hours"] = txt.split("\n")[0].strip()
+                        break
+            except Exception:
+                continue
+
+        # 7. Extract reviews count from detail panel
+        for sel in [
+            "span[aria-label*='review']",
+            "a:has-text('reviews')",
+            "a:has-text('review')",
+        ]:
+            try:
+                rev_el = page.query_selector(sel)
+                if rev_el:
+                    txt = (rev_el.get_attribute("aria-label") or rev_el.inner_text()).strip()
+                    m = re.search(r'([\d,.]+[kKmM]?)\s*review', txt)
+                    if m:
+                        raw = m.group(1).replace(",", "")
+                        km = re.match(r'^([\d.]+)([kKmM])$', raw)
+                        if km:
+                            num = float(km.group(1))
+                            suffix = km.group(2).lower()
+                            if suffix == 'k':
+                                extra["reviews_count"] = str(int(num * 1000))
+                            elif suffix == 'm':
+                                extra["reviews_count"] = str(int(num * 1000000))
+                        else:
+                            extra["reviews_count"] = raw
+                        break
+            except Exception:
+                continue
+
+        # 8. Extract Google Maps URL from detail panel
+        try:
+            maps_link = page.query_selector(
+                "a[href*='maps.google'], a[href*='google.com/maps'], "
+                "a[data-url*='maps.google'], a[data-url*='google.com/maps']"
+            )
+            if maps_link:
+                extra["google_maps_url"] = maps_link.get_attribute("href") or maps_link.get_attribute("data-url")
+        except Exception:
+            pass
+
+        # 10. Extract social links
         seen_socials: set[str] = set()
         try:
             for link in page.query_selector_all(
@@ -512,7 +602,7 @@ def scrape_detail_panel(page, card, debug: bool = False, timeout: int = 8000) ->
         except Exception:
             pass
 
-        # 7. Close the panel / go back
+        # 11. Close the panel / go back
         if navigated:
             page.go_back(wait_until="domcontentloaded", timeout=10_000)
             page.wait_for_timeout(random.randint(1000, 2000))
@@ -579,6 +669,12 @@ def merge_detail(info: dict, extra: dict):
         info["phone"] = extra["phone"]
     if extra.get("address"):
         info["address"] = extra["address"]
+    if extra.get("hours"):
+        info["hours"] = extra["hours"]
+    if extra.get("reviews_count"):
+        info["reviews_count"] = extra["reviews_count"]
+    if extra.get("google_maps_url"):
+        info["google_maps_url"] = extra["google_maps_url"]
     if extra.get("socials"):
         info["socials"] = extra["socials"]
 
