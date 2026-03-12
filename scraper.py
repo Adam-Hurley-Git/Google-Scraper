@@ -152,7 +152,7 @@ def find_business_cards(page, debug: bool = False) -> tuple[str, list]:
         except Exception:
             continue
 
-    # JS-based fallback: find elements that contain heading + rating-like content
+    # JS-based fallback: find elements that contain a heading (business name)
     try:
         cards = page.evaluate("""() => {
             // Look for elements that have a role=heading descendant
@@ -163,13 +163,10 @@ def find_business_cards(page, debug: bool = False) -> tuple[str, list]:
                 // Walk up to find a reasonable container (3-5 levels)
                 for (let i = 0; i < 5 && parent; i++) {
                     const text = parent.innerText || '';
-                    // A business card typically has a name + some info (rating, address, etc.)
-                    if (text.length > 30 && text.length < 2000) {
-                        // Check it has some business-like content
-                        if (/\\d\\.\\d|star|review|\\(\\d/i.test(text)) {
-                            candidates.push(parent);
-                            break;
-                        }
+                    // A business card has a name + some info (multiple lines)
+                    if (text.length > 20 && text.length < 2000 && text.includes('\\n')) {
+                        candidates.push(parent);
+                        break;
                     }
                     parent = parent.parentElement;
                 }
@@ -197,19 +194,33 @@ def find_business_cards(page, debug: bool = False) -> tuple[str, list]:
 
 def get_card_id(element) -> str:
     """Generate a unique identifier for a card to prevent duplicates."""
-    for attr in ["data-cid", "data-ludocid", "data-ved"]:
+    # Only use truly stable unique IDs (data-cid, data-ludocid)
+    # Do NOT use data-ved — it's a tracking token, not a business ID
+    for attr in ["data-cid", "data-ludocid"]:
         try:
             val = element.get_attribute(attr)
             if val:
                 return f"{attr}:{val}"
         except Exception:
             continue
-    # Fallback: use inner text hash
+    # Fallback: use the business name (most reliable dedup key)
     try:
-        text = element.inner_text()[:100]
-        return f"text:{hash(text)}"
+        # Try heading element first for clean name
+        heading = element.query_selector("[role='heading'], h3")
+        if heading:
+            name = heading.inner_text().strip()
+            if name:
+                return f"name:{name}"
     except Exception:
-        return f"pos:{id(element)}"
+        pass
+    # Last resort: first line of text
+    try:
+        text = element.inner_text().split("\n")[0].strip()
+        if text:
+            return f"text:{text}"
+    except Exception:
+        pass
+    return f"idx:{id(element)}"
 
 
 # ---------------------------------------------------------------------------
@@ -679,15 +690,15 @@ def merge_detail(info: dict, extra: dict):
         info["socials"] = extra["socials"]
 
 
-def relocate_card(page, strategy_label: str, card_id: str, cards_selector_used: str):
+def relocate_card(page, strategy_label: str, card_id: str, cards_selector_used: str, index: int = -1):
     """Re-find a card element after DOM mutations (e.g. after detail panel close).
 
-    Tries the original strategy selector and matches by card ID attribute.
+    Tries: data attribute query, then ID matching across all cards, then index fallback.
     """
     # If we have a data attribute ID, re-query directly
     if ":" in card_id:
         attr_name, attr_val = card_id.split(":", 1)
-        if attr_name in ("data-cid", "data-ludocid", "data-ved", "data-scraper-card"):
+        if attr_name in ("data-cid", "data-ludocid", "data-scraper-card"):
             try:
                 el = page.query_selector(f'[{attr_name}="{attr_val}"]')
                 if el:
@@ -695,12 +706,15 @@ def relocate_card(page, strategy_label: str, card_id: str, cards_selector_used: 
             except Exception:
                 pass
 
-    # Fallback: re-query all cards and match by text hash
+    # Re-query all cards and match by ID
     try:
         all_cards = page.query_selector_all(cards_selector_used)
         for card in all_cards:
             if get_card_id(card) == card_id:
                 return card
+        # Index-based fallback: if the ID changed but card is still at same position
+        if 0 <= index < len(all_cards):
+            return all_cards[index]
     except Exception:
         pass
 
@@ -726,24 +740,35 @@ def scrape_page_of_results(
     selector_map = {label: sel for label, sel in CARD_STRATEGIES}
     cards_selector = selector_map.get(strategy_label, "[data-scraper-card]")
 
-    # Collect card identifiers upfront
+    # Collect card identifiers upfront (with index for fallback relocation)
     card_refs = []
-    for card in cards:
+    for idx, card in enumerate(cards):
         card_id = get_card_id(card)
         if card_id not in seen_ids:
-            card_refs.append(card_id)
+            card_refs.append((card_id, idx))
             seen_ids.add(card_id)
 
+    print(f"  [*] {len(card_refs)} new cards to scrape (of {len(cards)} found)")
     new_on_page = 0
 
-    for card_id in card_refs:
+    for card_id, card_idx in card_refs:
         if len(results) >= max_results:
             break
 
         # Re-find the card (safe against stale references)
-        card = relocate_card(page, strategy_label, card_id, cards_selector)
+        card = relocate_card(page, strategy_label, card_id, cards_selector, index=card_idx)
         if not card:
-            continue
+            print(f"  [!] Could not relocate card {card_id}, retrying...")
+            # One more attempt: re-find all cards and use index
+            try:
+                all_cards = page.query_selector_all(cards_selector)
+                if card_idx < len(all_cards):
+                    card = all_cards[card_idx]
+            except Exception:
+                pass
+            if not card:
+                print(f"  [!] Skipping card (could not relocate after retry)")
+                continue
 
         count = len(results) + 1
         print(f"  [{count}] Scraping...", end="")
@@ -751,12 +776,21 @@ def scrape_page_of_results(
         try:
             info = scrape_business_card(page, card)
             if not info["name"]:
-                print(" skipped (no name)")
+                # Try harder: get first line of text as name
+                try:
+                    text = card.inner_text().strip()
+                    first_line = text.split("\n")[0].strip()
+                    if first_line and len(first_line) < 80:
+                        info["name"] = first_line
+                except Exception:
+                    pass
+            if not info["name"]:
+                print(" skipped (no name could be extracted)")
                 continue
 
             # Detail panel scraping
             if detail_scrape:
-                card = relocate_card(page, strategy_label, card_id, cards_selector)
+                card = relocate_card(page, strategy_label, card_id, cards_selector, index=card_idx)
                 if card:
                     extra = scrape_detail_panel(page, card, debug=debug)
                     merge_detail(info, extra)
