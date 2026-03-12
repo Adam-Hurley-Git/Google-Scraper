@@ -8,6 +8,7 @@ reviews count, hours, category, and more.
 Usage:
     python scraper.py --query "restaurants" --location "Swansea UK" --max-results 50
     python scraper.py --url "https://www.google.com/search?q=restaurant&udm=1&..."
+    python scraper.py --query "restaurants" --location "London" --debug --no-headless
 """
 
 import argparse
@@ -20,9 +21,10 @@ import time
 import random
 import shutil
 from datetime import datetime
-from urllib.parse import urlencode, urlparse, parse_qs
+from urllib.parse import urlencode
 
 from playwright.sync_api import sync_playwright
+
 try:
     from playwright_stealth import Stealth
     HAS_STEALTH = True
@@ -57,6 +59,33 @@ def find_chromium_executable() -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Debug infrastructure
+# ---------------------------------------------------------------------------
+
+_debug_counter = 0
+
+
+def save_debug_snapshot(page, label: str = "snapshot"):
+    """Save a screenshot and HTML dump for debugging."""
+    global _debug_counter
+    _debug_counter += 1
+    os.makedirs("debug", exist_ok=True)
+    prefix = f"debug/{_debug_counter:03d}_{label}"
+    try:
+        page.screenshot(path=f"{prefix}.png", full_page=True)
+        print(f"  [debug] Screenshot saved: {prefix}.png")
+    except Exception as e:
+        print(f"  [debug] Screenshot failed: {e}")
+    try:
+        html = page.content()
+        with open(f"{prefix}.html", "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"  [debug] HTML saved: {prefix}.html")
+    except Exception as e:
+        print(f"  [debug] HTML save failed: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
@@ -86,12 +115,8 @@ def build_search_url(query: str, location: str | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Core scraper helpers
+# Social domains for link detection
 # ---------------------------------------------------------------------------
-
-# Canonical selector for business cards — data-cid is a stable Google
-# attribute (unique per business) that avoids overlapping-selector dupes.
-CARD_SELECTOR = "div[data-cid]"
 
 SOCIAL_DOMAINS = [
     "facebook.com", "instagram.com", "twitter.com", "x.com",
@@ -99,37 +124,103 @@ SOCIAL_DOMAINS = [
 ]
 
 
-def collect_cids_from_page(page) -> list[str]:
-    """Return de-duped list of data-cid values from all business cards on current page."""
-    cards = page.query_selector_all(CARD_SELECTOR)
-    cids: list[str] = []
-    seen: set[str] = set()
-    for card in cards:
-        cid = card.get_attribute("data-cid")
-        if cid and cid not in seen:
-            cids.append(cid)
-            seen.add(cid)
-    return cids
+# ---------------------------------------------------------------------------
+# Multi-strategy card detection
+# ---------------------------------------------------------------------------
+
+CARD_STRATEGIES = [
+    # (label, selector)
+    ("data-cid", "div[data-cid]"),
+    ("rllt__link", "div.rllt__link"),
+    ("vwVdIc", "a.vwVdIc"),
+    ("data-ludocid", "div[data-ludocid]"),
+    ("data-ved-jscontroller", "div[jscontroller][data-ved]"),
+]
 
 
-def merge_detail(info: dict, extra: dict):
-    """Merge detail panel data into listing info, preferring detail data."""
-    if extra.get("website"):
-        info["website"] = extra["website"]
-    if extra.get("phone"):
-        info["phone"] = extra["phone"]
-    if extra.get("address"):
-        info["address"] = extra["address"]
-    if extra.get("socials"):
-        info["socials"] = extra["socials"]
+def find_business_cards(page, debug: bool = False) -> tuple[str, list]:
+    """Try multiple selector strategies to find business listing cards.
+
+    Returns (strategy_label, list_of_element_handles).
+    """
+    for label, selector in CARD_STRATEGIES:
+        try:
+            cards = page.query_selector_all(selector)
+            if cards and len(cards) > 0:
+                print(f"  [+] Card strategy '{label}' matched {len(cards)} elements")
+                return label, cards
+        except Exception:
+            continue
+
+    # JS-based fallback: find elements that contain heading + rating-like content
+    try:
+        cards = page.evaluate("""() => {
+            // Look for elements that have a role=heading descendant
+            const candidates = [];
+            const headings = document.querySelectorAll('[role="heading"]');
+            for (const h of headings) {
+                let parent = h.parentElement;
+                // Walk up to find a reasonable container (3-5 levels)
+                for (let i = 0; i < 5 && parent; i++) {
+                    const text = parent.innerText || '';
+                    // A business card typically has a name + some info (rating, address, etc.)
+                    if (text.length > 30 && text.length < 2000) {
+                        // Check it has some business-like content
+                        if (/\\d\\.\\d|star|review|\\(\\d/i.test(text)) {
+                            candidates.push(parent);
+                            break;
+                        }
+                    }
+                    parent = parent.parentElement;
+                }
+            }
+            // Deduplicate by removing children of other candidates
+            const unique = candidates.filter(c =>
+                !candidates.some(other => other !== c && other.contains(c))
+            );
+            // Tag them with a custom attribute so we can query them
+            unique.forEach((el, i) => el.setAttribute('data-scraper-card', i.toString()));
+            return unique.length;
+        }""")
+        if cards and cards > 0:
+            card_elements = page.query_selector_all("[data-scraper-card]")
+            if card_elements:
+                print(f"  [+] JS fallback strategy matched {len(card_elements)} elements")
+                return "js-fallback", card_elements
+    except Exception as e:
+        if debug:
+            print(f"  [debug] JS fallback error: {e}")
+
+    print("  [-] No card detection strategy found any results")
+    return "none", []
+
+
+def get_card_id(element) -> str:
+    """Generate a unique identifier for a card to prevent duplicates."""
+    for attr in ["data-cid", "data-ludocid", "data-ved"]:
+        try:
+            val = element.get_attribute(attr)
+            if val:
+                return f"{attr}:{val}"
+        except Exception:
+            continue
+    # Fallback: use inner text hash
+    try:
+        text = element.inner_text()[:100]
+        return f"text:{hash(text)}"
+    except Exception:
+        return f"pos:{id(element)}"
 
 
 # ---------------------------------------------------------------------------
 # Listing card extraction
 # ---------------------------------------------------------------------------
 
-def scrape_business_panel(page, element) -> dict:
-    """Extract all available data from a single business listing element."""
+def scrape_business_card(page, element) -> dict:
+    """Extract all available data from a single business listing card element.
+
+    Uses two layers: stable CSS selectors first, then text parsing fallback.
+    """
     info = {
         "name": None,
         "address": None,
@@ -145,97 +236,116 @@ def scrape_business_panel(page, element) -> dict:
         "google_maps_url": None,
     }
 
-    # --- Name ---
-    for sel in [
-        "div[role='heading']",
-        "[data-attrid='title'] span",
-        ".dbg0pd",
-        ".OSrXXb",
-        "span.OSrXXb",
-        "a .VkpGBb",
-    ]:
-        el = element.query_selector(sel)
-        if el:
-            txt = el.inner_text().strip()
-            if txt:
-                info["name"] = txt
-                break
+    # --- Layer 1: CSS selectors ---
 
-    # --- Link / website ---
-    for sel in [
-        "a[data-attrid='visit_website']",
-        "a[ping][href]:not([href*='google'])",
-        "a.yYlJEf",
-    ]:
-        el = element.query_selector(sel)
-        if el:
-            href = el.get_attribute("href") or ""
-            if href and "google" not in href:
-                info["website"] = href
-                break
-
-    # --- Google Maps link ---
-    maps_link = element.query_selector("a[href*='maps.google'], a[href*='google.com/maps']")
-    if maps_link:
-        info["google_maps_url"] = maps_link.get_attribute("href")
-
-    # --- Rating (prefer aria-label based, then class-based) ---
-    for sel in [
-        "span[aria-label*='Rated']",
-        "span[aria-label*='star']",
-        "span.yi40Hd",
-        "span.Fam1ne",
-    ]:
-        el = element.query_selector(sel)
-        if el:
-            label = el.get_attribute("aria-label") or el.inner_text()
-            m = re.search(r'([\d.]+)', label)
-            if m:
-                info["rating"] = m.group(1)
-                break
-
-    # --- Reviews count (prefer aria-label, then class-based) ---
-    rating_el = element.query_selector("span[aria-label*='review']")
-    if rating_el:
-        label = rating_el.get_attribute("aria-label") or ""
-        m = re.search(r'([\d,]+)\s*review', label)
-        if m:
-            info["reviews_count"] = m.group(1).replace(",", "")
-    if not info["reviews_count"]:
-        for sel in ["span.RDApEe", "span.hqzQac"]:
+    # Name
+    for sel in ["[role='heading']", "h3", "[aria-level]", "div[role='heading']"]:
+        try:
             el = element.query_selector(sel)
             if el:
-                txt = el.inner_text()
-                m = re.search(r'([\d,]+)', txt)
-                if m:
-                    info["reviews_count"] = m.group(1).replace(",", "")
+                txt = el.inner_text().strip()
+                if txt and len(txt) < 100:
+                    info["name"] = txt
                     break
+        except Exception:
+            continue
 
-    # --- Grab all visible text and parse phone / address from it ---
-    full_text = element.inner_text()
+    # Rating (aria-label based)
+    for sel in [
+        "span[aria-label*='star']",
+        "span[aria-label*='Rated']",
+        "span[aria-label*='rating']",
+    ]:
+        try:
+            el = element.query_selector(sel)
+            if el:
+                label = el.get_attribute("aria-label") or el.inner_text()
+                m = re.search(r'([\d.]+)', label)
+                if m:
+                    info["rating"] = m.group(1)
+                    break
+        except Exception:
+            continue
+
+    # Reviews count (aria-label based)
+    try:
+        rating_el = element.query_selector("span[aria-label*='review']")
+        if rating_el:
+            label = rating_el.get_attribute("aria-label") or ""
+            m = re.search(r'([\d,]+)\s*review', label)
+            if m:
+                info["reviews_count"] = m.group(1).replace(",", "")
+    except Exception:
+        pass
+
+    # Website link (non-Google external link)
+    try:
+        links = element.query_selector_all("a[href]")
+        for link in links:
+            href = link.get_attribute("href") or ""
+            if href.startswith("http") and "google" not in href and "gstatic" not in href:
+                info["website"] = href
+                break
+    except Exception:
+        pass
+
+    # Google Maps link
+    try:
+        maps_link = element.query_selector("a[href*='maps.google'], a[href*='google.com/maps']")
+        if maps_link:
+            info["google_maps_url"] = maps_link.get_attribute("href")
+    except Exception:
+        pass
+
+    # --- Layer 2: Text parsing fallback ---
+    try:
+        full_text = element.inner_text()
+    except Exception:
+        full_text = ""
+
     lines = [l.strip() for l in full_text.split("\n") if l.strip()]
 
+    # Name fallback
+    if not info["name"] and lines:
+        # First substantial line is usually the name
+        for line in lines:
+            if len(line) > 1 and len(line) < 80 and not re.match(r'^[\d.]+$', line):
+                info["name"] = line
+                break
+
+    # Rating fallback
+    if not info["rating"]:
+        m = re.search(r'(\d\.\d)\s*(?:\(|star|★)', full_text)
+        if m:
+            info["rating"] = m.group(1)
+
+    # Reviews count fallback
+    if not info["reviews_count"]:
+        m = re.search(r'\((\d[\d,]*)\)', full_text)
+        if m:
+            info["reviews_count"] = m.group(1).replace(",", "")
+
+    # Category: short line after name that isn't address/phone
+    if not info["category"] and info["name"] and len(lines) > 1:
+        name_idx = None
+        for i, line in enumerate(lines):
+            if line == info["name"]:
+                name_idx = i
+                break
+        if name_idx is not None and name_idx + 1 < len(lines):
+            candidate = lines[name_idx + 1]
+            if len(candidate) < 40 and not extract_phone(candidate) and not re.search(r'\d+\s+\w+\s+(St|Ave|Rd)', candidate, re.I):
+                info["category"] = candidate
+
+    # Phone
     if not info["phone"]:
         info["phone"] = extract_phone(full_text)
 
-    # --- Category ---
-    for sel in [".YhemCb", ".rllt__wrapped"]:
-        el = element.query_selector(sel)
-        if el:
-            info["category"] = el.inner_text().strip()
-            break
-    # Heuristic: short line right after name that isn't the address or phone
-    if not info["category"] and len(lines) > 1:
-        candidate = lines[1] if info["name"] and lines[0] == info["name"] else None
-        if candidate and len(candidate) < 40 and not extract_phone(candidate):
-            info["category"] = candidate
-
-    # --- Address (heuristic: line with a number that looks like a street address) ---
+    # Address (heuristic: line with street-like pattern)
     for line in lines:
         if re.search(r'\d+\s+\w+\s+(St|Ave|Rd|Blvd|Dr|Ln|Way|Street|Road|Avenue|Place|Pl|Ct|Sq|High|Terr)', line, re.I):
             info["address"] = line
             break
-    # Fallback: look for lines with postcodes
     if not info["address"]:
         for line in lines:
             if re.search(r'\b[A-Z]{1,2}\d[\dA-Z]?\s?\d[A-Z]{2}\b', line):  # UK postcode
@@ -245,22 +355,13 @@ def scrape_business_panel(page, element) -> dict:
                 info["address"] = line
                 break
 
-    # --- Hours ---
-    for sel in [".rllt__details div:has-text('Open')", "span:has-text('Open')", "span:has-text('Closed')"]:
-        try:
-            el = element.query_selector(sel)
-            if el:
-                info["hours"] = el.inner_text().strip()
-                break
-        except Exception:
-            pass
-    if not info["hours"]:
-        for line in lines:
-            if re.search(r'(Open|Closed|Hours|am|pm|AM|PM)', line):
-                info["hours"] = line
-                break
+    # Hours
+    for line in lines:
+        if re.search(r'(Open|Closed|Hours|am|pm|AM|PM)', line):
+            info["hours"] = line
+            break
 
-    # --- Price range ---
+    # Price range
     m = re.search(r'([$£€]{1,4})\s*[-–]\s*([$£€]{1,4})', full_text)
     if m:
         info["price_range"] = f"{m.group(1)}-{m.group(2)}"
@@ -269,7 +370,7 @@ def scrape_business_panel(page, element) -> dict:
         if m and len(m.group(1)) <= 4:
             info["price_range"] = m.group(1)
 
-    # --- Services (dine-in, takeaway, delivery) ---
+    # Services
     for kw in ["Dine-in", "Takeaway", "Takeout", "Delivery", "Kerbside pickup", "Curbside pickup", "In-store pickup"]:
         if kw.lower() in full_text.lower():
             info["services"].append(kw)
@@ -278,11 +379,11 @@ def scrape_business_panel(page, element) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Detail panel extraction (click-based, NOT page navigation)
+# Detail panel extraction (click card → extract → close)
 # ---------------------------------------------------------------------------
 
-def scrape_detail_panel(page, card, timeout: int = 8000) -> dict:
-    """Click a business card to open its detail panel, extract data, then close it."""
+def scrape_detail_panel(page, card, debug: bool = False, timeout: int = 8000) -> dict:
+    """Click a business card to open its detail panel, extract enriched data, then close it."""
     extra = {
         "website": None,
         "phone": None,
@@ -293,101 +394,142 @@ def scrape_detail_panel(page, card, timeout: int = 8000) -> dict:
     url_before = page.url
 
     try:
-        # 1. Click the card to open the detail panel
+        # 1. Click the card
         card.click()
         page.wait_for_timeout(random.randint(1500, 2500))
 
-        # 2. Check if it navigated away (some cards are links)
         navigated = page.url != url_before
 
-        # 3. Wait for detail panel content to appear
+        # 2. Wait for detail content to appear
         try:
             page.wait_for_selector(
-                "[data-attrid*='phone'], [data-attrid*='address'], "
-                "a[data-attrid='visit_website'], a[href^='tel:']",
+                "a[href^='tel:'], [data-attrid*='phone'], [data-attrid*='address'], "
+                "a[data-attrid='visit_website'], a:has-text('Website')",
                 timeout=timeout,
             )
         except Exception:
-            pass  # Panel may not have all fields; extract what we can
+            pass  # Panel may not have all fields
 
         page.wait_for_timeout(random.randint(500, 1000))
 
-        # 4. Extract website
+        if debug:
+            save_debug_snapshot(page, "detail_panel")
+
+        # 3. Extract website
         for sel in [
+            "a:has-text('Website')",
             "a[data-attrid='visit_website']",
             "[data-attrid='visit_website'] a[href]",
-            "a[href]:has-text('Website')",
             "a.n1obkb[href]",
         ]:
-            website_el = page.query_selector(sel)
-            if website_el:
-                href = website_el.get_attribute("href") or ""
-                if href and "google" not in href:
-                    extra["website"] = href
-                    break
+            try:
+                website_el = page.query_selector(sel)
+                if website_el:
+                    href = website_el.get_attribute("href") or ""
+                    if href and "google" not in href:
+                        extra["website"] = href
+                        break
+            except Exception:
+                continue
 
-        # 5. Extract phone
+        # Fallback: first non-Google link in the detail area
+        if not extra["website"]:
+            try:
+                all_links = page.query_selector_all("a[href^='http']")
+                for link in all_links:
+                    href = link.get_attribute("href") or ""
+                    text = link.inner_text().strip().lower()
+                    if href and "google" not in href and "gstatic" not in href:
+                        # Prefer links that say "website" or are prominent
+                        if "website" in text or "site" in text:
+                            extra["website"] = href
+                            break
+            except Exception:
+                pass
+
+        # 4. Extract phone
         for sel in [
             "a[href^='tel:']",
             "[data-attrid*='phone'] span.LrzXr",
             "[data-attrid*='phone'] span",
         ]:
-            phone_el = page.query_selector(sel)
-            if phone_el:
-                if sel.startswith("a[href"):
-                    href = phone_el.get_attribute("href") or ""
-                    txt = href.replace("tel:", "").strip()
-                else:
-                    txt = phone_el.inner_text().strip()
-                if txt and len(txt) > 5:
-                    extra["phone"] = txt
-                    break
+            try:
+                phone_el = page.query_selector(sel)
+                if phone_el:
+                    if sel.startswith("a[href"):
+                        href = phone_el.get_attribute("href") or ""
+                        txt = href.replace("tel:", "").strip()
+                    else:
+                        txt = phone_el.inner_text().strip()
+                    if txt and len(txt) > 5:
+                        extra["phone"] = txt
+                        break
+            except Exception:
+                continue
 
-        # 6. Extract address
+        # 5. Extract address
         for sel in [
             "[data-attrid*='address'] span.LrzXr",
             "[data-attrid*='address'] span",
         ]:
-            addr_el = page.query_selector(sel)
-            if addr_el:
-                txt = addr_el.inner_text().strip()
-                if txt:
-                    extra["address"] = txt
-                    break
+            try:
+                addr_el = page.query_selector(sel)
+                if addr_el:
+                    txt = addr_el.inner_text().strip()
+                    if txt:
+                        extra["address"] = txt
+                        break
+            except Exception:
+                continue
 
-        # 7. Extract social links
+        # Address fallback: text parsing from panel
+        if not extra["address"]:
+            try:
+                panel_text = page.inner_text("body")
+                for line in panel_text.split("\n"):
+                    line = line.strip()
+                    if re.search(r'\d+\s+\w+\s+(St|Ave|Rd|Blvd|Dr|Ln|Way|Street|Road|Avenue|Place|Pl|Ct|Sq|High|Terr)', line, re.I):
+                        extra["address"] = line
+                        break
+            except Exception:
+                pass
+
+        # 6. Extract social links
         seen_socials: set[str] = set()
-        for link in page.query_selector_all(
-            "[data-attrid*='social'] a[href], "
-            "a[href*='facebook.com'], a[href*='instagram.com'], "
-            "a[href*='twitter.com'], a[href*='x.com'], "
-            "a[href*='tiktok.com'], a[href*='linkedin.com'], "
-            "a[href*='youtube.com'], a[href*='yelp.com']"
-        ):
-            href = link.get_attribute("href") or ""
-            for domain in SOCIAL_DOMAINS:
-                if domain in href and href not in seen_socials:
-                    extra["socials"].append(href)
-                    seen_socials.add(href)
-                    break
+        try:
+            for link in page.query_selector_all(
+                "a[href*='facebook.com'], a[href*='instagram.com'], "
+                "a[href*='twitter.com'], a[href*='x.com'], "
+                "a[href*='tiktok.com'], a[href*='linkedin.com'], "
+                "a[href*='youtube.com'], a[href*='yelp.com']"
+            ):
+                href = link.get_attribute("href") or ""
+                for domain in SOCIAL_DOMAINS:
+                    if domain in href and href not in seen_socials:
+                        extra["socials"].append(href)
+                        seen_socials.add(href)
+                        break
+        except Exception:
+            pass
 
-        # 8. Close the panel / go back
+        # 7. Close the panel / go back
         if navigated:
             page.go_back(wait_until="domcontentloaded", timeout=10_000)
             page.wait_for_timeout(random.randint(1000, 2000))
         else:
-            # Try Escape to close the side panel
             page.keyboard.press("Escape")
             page.wait_for_timeout(random.randint(800, 1500))
-            # If panel is still open (URL has a fragment or panel element), try back button
-            close_btn = page.query_selector("button[aria-label='Close'], g-back-button")
-            if close_btn:
-                close_btn.click()
-                page.wait_for_timeout(random.randint(500, 1000))
+            # Check if panel closed by looking for close button
+            try:
+                close_btn = page.query_selector("button[aria-label='Close'], g-back-button")
+                if close_btn:
+                    close_btn.click()
+                    page.wait_for_timeout(random.randint(500, 1000))
+            except Exception:
+                pass
 
     except Exception as e:
-        print(f" [!] detail error: {e}")
-        # Recover: try Escape and go_back as fallbacks
+        print(f"  [!] Detail panel error: {e}")
         try:
             page.keyboard.press("Escape")
             page.wait_for_timeout(500)
@@ -409,39 +551,101 @@ def scrape_detail_panel(page, card, timeout: int = 8000) -> dict:
 
 def handle_consent(page):
     """Dismiss Google's cookie consent / GDPR banner if present."""
+    consent_selectors = [
+        "button:has-text('Accept all')",
+        "button:has-text('Accept')",
+        "button:has-text('I agree')",
+        "button:has-text('Reject all')",
+        "#L2AGLb",
+        "button[aria-label*='Accept']",
+        "form[action*='consent'] button",
+    ]
+    for sel in consent_selectors:
+        try:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                btn.click()
+                page.wait_for_timeout(1500)
+                return
+        except Exception:
+            continue
+
+
+def merge_detail(info: dict, extra: dict):
+    """Merge detail panel data into listing info, preferring detail data."""
+    if extra.get("website"):
+        info["website"] = extra["website"]
+    if extra.get("phone"):
+        info["phone"] = extra["phone"]
+    if extra.get("address"):
+        info["address"] = extra["address"]
+    if extra.get("socials"):
+        info["socials"] = extra["socials"]
+
+
+def relocate_card(page, strategy_label: str, card_id: str, cards_selector_used: str):
+    """Re-find a card element after DOM mutations (e.g. after detail panel close).
+
+    Tries the original strategy selector and matches by card ID attribute.
+    """
+    # If we have a data attribute ID, re-query directly
+    if ":" in card_id:
+        attr_name, attr_val = card_id.split(":", 1)
+        if attr_name in ("data-cid", "data-ludocid", "data-ved", "data-scraper-card"):
+            try:
+                el = page.query_selector(f'[{attr_name}="{attr_val}"]')
+                if el:
+                    return el
+            except Exception:
+                pass
+
+    # Fallback: re-query all cards and match by text hash
     try:
-        accept_btn = page.query_selector(
-            "button:has-text('Accept all'), button:has-text('Accept'), "
-            "button:has-text('I agree'), button:has-text('Reject all')"
-        )
-        if accept_btn:
-            accept_btn.click()
-            page.wait_for_timeout(1500)
+        all_cards = page.query_selector_all(cards_selector_used)
+        for card in all_cards:
+            if get_card_id(card) == card_id:
+                return card
     except Exception:
         pass
 
+    return None
+
 
 def scrape_page_of_results(
-    page, seen_cids: set, results: list, max_results: int, detail_scrape: bool,
+    page, seen_ids: set, results: list, max_results: int,
+    detail_scrape: bool, debug: bool,
 ):
-    """Scrape all business cards on the current page, appending to results.
+    """Scrape all business cards on the current page, appending to results."""
+    strategy_label, cards = find_business_cards(page, debug=debug)
 
-    Uses CID-first strategy: collect all data-cid values, then re-query each
-    card individually. This avoids stale element references after detail panel
-    interactions.
-    """
-    cids = collect_cids_from_page(page)
+    if not cards:
+        if debug:
+            save_debug_snapshot(page, "no_cards_found")
+        else:
+            # Always save debug snapshot when zero cards found
+            save_debug_snapshot(page, "no_cards_auto")
+        return 0
+
+    # Determine the selector used for this strategy (for relocating cards later)
+    selector_map = {label: sel for label, sel in CARD_STRATEGIES}
+    cards_selector = selector_map.get(strategy_label, "[data-scraper-card]")
+
+    # Collect card identifiers upfront
+    card_refs = []
+    for card in cards:
+        card_id = get_card_id(card)
+        if card_id not in seen_ids:
+            card_refs.append(card_id)
+            seen_ids.add(card_id)
+
     new_on_page = 0
 
-    for cid in cids:
+    for card_id in card_refs:
         if len(results) >= max_results:
             break
-        if cid in seen_cids:
-            continue
-        seen_cids.add(cid)
 
-        # Re-query the card by CID (safe against stale references)
-        card = page.query_selector(f'{CARD_SELECTOR}[data-cid="{cid}"]')
+        # Re-find the card (safe against stale references)
+        card = relocate_card(page, strategy_label, card_id, cards_selector)
         if not card:
             continue
 
@@ -449,17 +653,16 @@ def scrape_page_of_results(
         print(f"  [{count}] Scraping...", end="")
 
         try:
-            info = scrape_business_panel(page, card)
+            info = scrape_business_card(page, card)
             if not info["name"]:
                 print(" skipped (no name)")
                 continue
 
-            # Detail panel scraping (click card → extract → close)
+            # Detail panel scraping
             if detail_scrape:
-                # Re-query card again in case DOM shifted
-                card = page.query_selector(f'{CARD_SELECTOR}[data-cid="{cid}"]')
+                card = relocate_card(page, strategy_label, card_id, cards_selector)
                 if card:
-                    extra = scrape_detail_panel(page, card)
+                    extra = scrape_detail_panel(page, card, debug=debug)
                     merge_detail(info, extra)
 
             # Convert lists to strings for CSV
@@ -490,14 +693,15 @@ def scrape_google_businesses(
     headless: bool = True,
     slow_mo: int = 0,
     detail_scrape: bool = True,
+    debug: bool = False,
 ) -> list[dict]:
     """
     Main scraping function.
     Provide either a full `url` or a `query` (+optional `location`).
 
     Two-phase approach:
-      Phase 1 — scrape the initial udm=1 page
-      Phase 2 — click "More places" → paginate through Local Finder pages
+      Phase 1 -- scrape the initial udm=1 page
+      Phase 2 -- click "More places" or paginate through results
     """
 
     if not url:
@@ -507,7 +711,7 @@ def scrape_google_businesses(
     print(f"[*] Max results: {max_results}")
 
     results: list[dict] = []
-    seen_cids: set[str] = set()
+    seen_ids: set[str] = set()
 
     with sync_playwright() as pw:
         launch_kwargs = dict(
@@ -518,7 +722,6 @@ def scrape_google_businesses(
                 "--no-sandbox",
             ],
         )
-        # Auto-detect Chromium binary if Playwright can't find its own
         chrome_path = find_chromium_executable()
         if chrome_path:
             launch_kwargs["executable_path"] = chrome_path
@@ -530,7 +733,7 @@ def scrape_google_businesses(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
+                "Chrome/131.0.0.0 Safari/537.36"
             ),
             locale="en-GB",
         )
@@ -539,40 +742,56 @@ def scrape_google_businesses(
             try:
                 Stealth().apply_stealth_sync(page)
             except Exception:
-                pass  # Stealth is optional; continue without it
+                pass
 
         # Navigate to initial page
         page.goto(url, wait_until="domcontentloaded", timeout=30_000)
         handle_consent(page)
         page.wait_for_timeout(random.randint(2000, 4000))
 
+        if debug:
+            save_debug_snapshot(page, "initial_page")
+
         # ---------------------------------------------------------------
         # Phase 1: Scrape the initial udm=1 page
         # ---------------------------------------------------------------
         print("[*] Phase 1: Scraping initial results page...")
         initial_count = scrape_page_of_results(
-            page, seen_cids, results, max_results, detail_scrape,
+            page, seen_ids, results, max_results, detail_scrape, debug,
         )
         print(f"[*] Phase 1 done: {initial_count} businesses from initial page")
 
         # ---------------------------------------------------------------
-        # Phase 2: Click "More places" → paginate through Local Finder
+        # Phase 2: Paginate through more results
         # ---------------------------------------------------------------
         if len(results) < max_results:
             # Try to enter the Local Finder by clicking "More places"
-            more_btn = page.query_selector(
-                "a:has-text('More places'), a:has-text('More businesses'), "
-                "a[aria-label*='More places'], a[aria-label*='More businesses']"
-            )
+            more_btn = None
+            for sel in [
+                "a:has-text('More places')",
+                "a:has-text('More businesses')",
+                "a[aria-label*='More places']",
+                "a[aria-label*='More businesses']",
+            ]:
+                try:
+                    more_btn = page.query_selector(sel)
+                    if more_btn and more_btn.is_visible():
+                        break
+                    more_btn = None
+                except Exception:
+                    continue
+
             if more_btn:
                 print("[*] Phase 2: Clicking 'More places' to enter Local Finder...")
                 more_btn.click()
                 page.wait_for_timeout(random.randint(2500, 4000))
-                handle_consent(page)  # May reappear after navigation
+                handle_consent(page)
+                if debug:
+                    save_debug_snapshot(page, "more_places")
             else:
                 print("[*] No 'More places' button found; trying pagination on current page...")
 
-            # Paginate through Local Finder pages
+            # Paginate through pages
             max_pages = (max_results // 10) + 5
             for page_num in range(max_pages):
                 if len(results) >= max_results:
@@ -580,10 +799,23 @@ def scrape_google_businesses(
 
                 print(f"[*] Page {page_num + 2}: scraping...")
                 new_count = scrape_page_of_results(
-                    page, seen_cids, results, max_results, detail_scrape,
+                    page, seen_ids, results, max_results, detail_scrape, debug,
                 )
 
                 if new_count == 0:
+                    # Try scrolling to load more
+                    prev_count = len(results)
+                    try:
+                        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        page.wait_for_timeout(2000)
+                        scroll_count = scrape_page_of_results(
+                            page, seen_ids, results, max_results, detail_scrape, debug,
+                        )
+                        if scroll_count > 0:
+                            print(f"[*] Scroll loaded {scroll_count} more results")
+                            continue
+                    except Exception:
+                        pass
                     print("[*] No new results on this page, stopping pagination.")
                     break
 
@@ -593,19 +825,31 @@ def scrape_google_businesses(
                     break
 
                 # Navigate to next page
-                next_btn = page.query_selector(
-                    "a#pnnext, "
-                    "a[aria-label='Next page'], "
-                    "a[aria-label='Next'], "
-                    "td.d6cvqb a[id='pnnext'], "
-                    "a:has-text('Next')"
-                )
+                next_btn = None
+                for sel in [
+                    "a#pnnext",
+                    "a[aria-label='Next page']",
+                    "a[aria-label='Next']",
+                    "td.d6cvqb a[id='pnnext']",
+                    "a:has-text('Next')",
+                ]:
+                    try:
+                        next_btn = page.query_selector(sel)
+                        if next_btn and next_btn.is_visible():
+                            break
+                        next_btn = None
+                    except Exception:
+                        continue
+
                 if not next_btn:
                     print("[*] No 'Next' button found, reached last page.")
                     break
 
                 next_btn.click()
                 page.wait_for_timeout(random.randint(2500, 4000))
+
+                if debug:
+                    save_debug_snapshot(page, f"page_{page_num + 2}")
 
         browser.close()
 
@@ -666,6 +910,8 @@ def main():
                         help="Run browser with visible window")
     parser.add_argument("--no-detail", action="store_true",
                         help="Skip opening individual business pages for extra data")
+    parser.add_argument("--debug", action="store_true",
+                        help="Save screenshots and HTML dumps to debug/ directory")
 
     args = parser.parse_args()
 
@@ -678,10 +924,12 @@ def main():
         max_results=args.max_results,
         headless=headless,
         detail_scrape=not args.no_detail,
+        debug=args.debug,
     )
 
     if not data:
         print("[!] No results scraped. Google may have changed its page structure or blocked the request.")
+        print("[!] Try running with --debug --no-headless to inspect what Google is returning.")
         sys.exit(1)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

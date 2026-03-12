@@ -6,3 +6,4 @@ output/
 *.csv
 *.json
 .DS_Store
+debug/
